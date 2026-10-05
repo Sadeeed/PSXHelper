@@ -137,7 +137,6 @@ class TestSarmaayaClient(unittest.TestCase):
                 "stocks/reports/FFL",
                 {"params": {"year": 2025}},
             ),
-            ("get_stock_returns", ("ffl",), "stocks/returns/FFL", {}),
         ]
         for method, args, endpoint, kwargs in cases:
             with (
@@ -146,6 +145,43 @@ class TestSarmaayaClient(unittest.TestCase):
             ):
                 self.assertEqual(getattr(self.client, method)(*args), {})
                 get.assert_called_once_with(endpoint, **kwargs)
+
+    def test_performance_normalizes_symbols_and_numeric_horizons(self):
+        rows = [
+            {"symbol": "DEMO_ALT", "1w": "1.25", "1m": "-2.5", "3m": "0", "6m": None, "1y": "invalid"},
+            {"symbol": "KSE100", "1w": "2", "1m": "3", "3m": "4", "6m": "5", "1y": "6"},
+        ]
+        with patch.object(self.client, "_get", return_value=rows) as get:
+            result = self.client.get_performance("demo_alt")
+        get.assert_called_once_with("stocks/returns/DEMO_ALT")
+        expected = pd.DataFrame({
+            "symbol": ["DEMO_ALT", "KSE100"], "1w": [1.25, 2.0], "1m": [-2.5, 3.0],
+            "3m": [0, 4], "6m": [float("nan"), 5.0], "1y": [float("nan"), 6.0],
+        })
+        pd.testing.assert_frame_equal(result, expected)
+
+    def test_performance_empty_and_partial_horizons(self):
+        for rows in ([], [{"symbol": "DEMO_ALT", "1w": "1.5"}]):
+            with self.subTest(rows=rows), patch.object(self.client, "_get", return_value=rows) as get:
+                result = self.client.get_performance("demo_alt")
+                get.assert_called_once_with("stocks/returns/DEMO_ALT")
+                expected = pd.DataFrame(rows)
+                if rows:
+                    expected["1w"] = pd.Series([1.5])
+                pd.testing.assert_frame_equal(result, expected)
+
+    def test_stock_returns_delegates_to_performance(self):
+        frame = pd.DataFrame({"symbol": ["DEMO_ALT"], "1w": [1.25]})
+        with patch.object(self.client, "get_performance", return_value=frame) as performance:
+            self.assertIs(self.client.get_stock_returns("demo_alt"), frame)
+        performance.assert_called_once_with("demo_alt")
+
+    def test_stock_returns_propagates_performance_failure(self):
+        error = requests.HTTPError("unavailable")
+        with patch.object(self.client, "_get", side_effect=error):
+            with self.assertRaises(requests.HTTPError) as caught:
+                self.client.get_stock_returns("demo_alt")
+        self.assertIs(caught.exception, error)
 
     def test_dividends_preserve_payout_history_and_yearly_summaries(self):
         rows = [{"symbol": "DEMO_REIT", "announcementDate": "2026-07-01",
@@ -275,6 +311,8 @@ class TestSarmaayaClient(unittest.TestCase):
     def test_fundamentals_resolve_isin_and_periodicity(self):
         for method, endpoint in (
             ("get_income_statement", "income-statement"),
+            ("get_balance_sheet", "balance-sheet"),
+            ("get_cash_flow", "cashflow"),
             ("get_financial_ratios", "ratios"),
         ):
             for kwargs, periodicity in (
@@ -283,7 +321,9 @@ class TestSarmaayaClient(unittest.TestCase):
                 ({"periodicity": "ltm"}, "LTM"),
             ):
                 with self.subTest(method=method, periodicity=periodicity):
-                    data = [{"value": 10}]
+                    data = {"Synthetic metric": {"metric": "FF_TEST", "displayType": "wholeNumber",
+                        "data": [{"value": "10.00", "date": "2025-06-30T00:00:00.000Z",
+                                  "year": 2025, "periodicity": periodicity, "fiscalPeriod": 0}]}}
                     with (
                         patch.object(
                             self.client, "get_isin", return_value="PK123"
@@ -296,11 +336,13 @@ class TestSarmaayaClient(unittest.TestCase):
                             f"stocks/fundamentals/{endpoint}",
                             params={"isin": "PK123", "periodicity": periodicity},
                         )
-                        pd.testing.assert_frame_equal(result, pd.DataFrame(data))
+                        self.assertIs(result, data)
 
     def test_fundamentals_isolate_cookies_and_preserve_request_policy(self):
         for method, endpoint in (
             ("get_income_statement", "income-statement"),
+            ("get_balance_sheet", "balance-sheet"),
+            ("get_cash_flow", "cashflow"),
             ("get_financial_ratios", "ratios"),
         ):
             with self.subTest(method=method):
@@ -319,11 +361,14 @@ class TestSarmaayaClient(unittest.TestCase):
                 fresh.__enter__.return_value = fresh
                 fresh.headers = {}
                 fresh.cookies = requests.cookies.RequestsCookieJar()
-                fresh.get.return_value.json.return_value = {"response": [{"value": 10}]}
+                data = {"Synthetic metric": {"metric": "FF_TEST", "displayType": "wholeNumber",
+                    "data": [{"value": "10.00", "date": "2025-06-30", "year": 2025,
+                              "periodicity": "ANN", "fiscalPeriod": 0}]}}
+                fresh.get.return_value.json.return_value = {"response": data}
                 with patch("utils.sarmaaya_util.requests.Session", side_effect=[stock, fresh]) as factory:
                     result = getattr(self.client, method)("ffl")
                 self.assertEqual(factory.call_count, 2)
-                pd.testing.assert_frame_equal(result, pd.DataFrame([{"value": 10}]))
+                self.assertIs(result, data)
                 self.session.get.assert_not_called()
                 stock.get.assert_called_once_with(
                     f"{SarmaayaClient.BASE_URL}/stocks/FFL", params=None, timeout=30)
@@ -339,6 +384,81 @@ class TestSarmaayaClient(unittest.TestCase):
                 self.assertIs(adapter.max_retries, retry)
                 fresh.__exit__.assert_called_once()
                 stock.__exit__.assert_called_once()
+
+    def test_fundamentals_df_counterparts_delegate_with_statement_type(self):
+        for raw_method, statement_type in (
+            ("get_income_statement", "income_statement"),
+            ("get_balance_sheet", "balance_sheet"),
+            ("get_cash_flow", "cash_flow"),
+            ("get_financial_ratios", "ratios"),
+        ):
+            for periodicity in ("ANN", "ltm"):
+                with self.subTest(method=raw_method, periodicity=periodicity):
+                    data = {"Test": {"metric": "FF_TEST", "displayType": "wholeNumber", "data": []}}
+                    frame = pd.DataFrame()
+                    with (patch.object(self.client, raw_method, return_value=data) as raw,
+                          patch.object(self.client, "normalize_fundamentals", return_value=frame) as normalize):
+                        result = getattr(self.client, raw_method + "_df")("demo_alt", periodicity)
+                    self.assertIs(result, frame)
+                    raw.assert_called_once_with("demo_alt", periodicity)
+                    normalize.assert_called_once_with(data, statement_type=statement_type)
+
+    def test_fundamentals_df_counterparts_normalize_actual_response_shape(self):
+        for raw_method, statement_type in (
+            ("get_income_statement", "income_statement"),
+            ("get_balance_sheet", "balance_sheet"),
+            ("get_cash_flow", "cash_flow"),
+            ("get_financial_ratios", "ratios"),
+        ):
+            with self.subTest(method=raw_method):
+                data = {
+                    "Synthetic amount": {"metric": "FF_TEST", "displayType": "wholeNumber", "data": [
+                        {"value": 12.5, "date": "2025-06-30T00:00:00.000Z", "year": 2025,
+                         "periodicity": "ANN", "fiscalPeriod": 0},
+                        {"value": "0.000", "date": "2024-06-30T00:00:00.000Z", "year": "2024",
+                         "periodicity": "ANN", "fiscalPeriod": "0"}]},
+                    "Synthetic margin": {"metric": "FF_TEST_MARGIN", "displayType": "floatPercent", "data": [
+                        {"value": "-2.5", "date": "2025-06-30T00:00:00.000Z", "year": 2025,
+                         "periodicity": "ANN", "fiscalPeriod": 0}]},
+                }
+                with patch.object(self.client, raw_method, return_value=data):
+                    result = getattr(self.client, raw_method + "_df")("demo_alt")
+                expected = pd.DataFrame({
+                    "statement_type": [statement_type] * 3,
+                    "name": ["Synthetic amount", "Synthetic amount", "Synthetic margin"],
+                    "metric": ["FF_TEST", "FF_TEST", "FF_TEST_MARGIN"],
+                    "display_type": ["wholeNumber", "wholeNumber", "floatPercent"],
+                    "value": [12.5, 0.0, -2.5],
+                    "period_end": pd.to_datetime(["2025-06-30", "2024-06-30", "2025-06-30"], utc=True),
+                    "year": pd.Series([2025, 2024, 2025], dtype="Int64"),
+                    "periodicity": ["ANN"] * 3,
+                    "fiscal_period": pd.Series([0, 0, 0], dtype="Int64"),
+                })
+                pd.testing.assert_frame_equal(result, expected)
+
+    def test_normalize_fundamentals_missing_values_and_ltm_are_not_invented(self):
+        data = {"Synthetic metric": {"metric": "FF_TEST", "displayType": "float", "data": [
+            {"value": "bad", "date": "bad", "year": None, "periodicity": "LTM", "fiscalPeriod": None},
+            {"value": None, "date": None, "periodicity": "LTM"},
+            {"value": "2", "date": "2026-03-31T05:00:00.000Z", "year": "2027",
+             "periodicity": "LTM", "fiscalPeriod": "3"}]}}
+        result = self.client.normalize_fundamentals(data, statement_type="ratios")
+        self.assertEqual(len(result), 3)
+        self.assertTrue(result.loc[:1, "value"].isna().all())
+        self.assertTrue(result.loc[:1, "period_end"].isna().all())
+        self.assertTrue(result.loc[:1, "year"].isna().all())
+        self.assertTrue(result.loc[:1, "fiscal_period"].isna().all())
+        self.assertEqual(result["periodicity"].tolist(), ["LTM"] * 3)
+        self.assertEqual(result.loc[2, "period_end"], pd.Timestamp("2026-03-31T05:00:00Z"))
+        self.assertEqual(result.loc[2, "year"], 2027)
+        self.assertEqual(result.loc[2, "fiscal_period"], 3)
+        self.assertEqual(result.loc[2, "value"], 2)
+
+    def test_normalize_fundamentals_empty_and_non_object_entries(self):
+        for data in (None, [], {}, {"bad": 1}, {"empty": {"data": []}},
+                     {"bad": {"data": [None, 1, "bad"]}}):
+            with self.subTest(data=data):
+                self.assertTrue(self.client.normalize_fundamentals(data).empty)
 
     def test_dividends_isolate_cookies_and_preserve_request_policy(self):
         self.session.reset_mock()
@@ -453,7 +573,8 @@ class TestSarmaayaClient(unittest.TestCase):
         self.session.post.assert_not_called()
 
     def test_invalid_periodicity_fails_before_requests(self):
-        for method in ("get_income_statement", "get_financial_ratios"):
+        for method in ("get_income_statement", "get_balance_sheet", "get_cash_flow", "get_financial_ratios",
+                       "get_income_statement_df", "get_balance_sheet_df", "get_cash_flow_df", "get_financial_ratios_df"):
             for periodicity in ("QTR", "", "annual"):
                 with (
                     self.subTest(method=method, periodicity=periodicity),

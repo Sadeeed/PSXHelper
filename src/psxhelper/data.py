@@ -36,8 +36,8 @@ class DataUnavailable(RuntimeError):
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,15}", symbol) or symbol not in SUPPORTED_SYMBOLS:
-        raise UnknownSymbol("Unknown or unsupported symbol; supported: DCR, AHCL")
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9_.-]{0,15}", symbol):
+        raise UnknownSymbol("Invalid ticker format")
     return symbol
 
 
@@ -66,13 +66,25 @@ class SarmaayaAdapter:
         symbol = normalize_symbol(symbol)
         client = self.client_factory()
         try:
-            info = client.get_stock_info(symbol)
+            try:
+                info = client.get_stock_info(symbol)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    raise UnknownSymbol(f"Provider does not recognize ticker {symbol}") from exc
+                raise
+            if info is None or info == {} or info == []:
+                raise UnknownSymbol(f"Provider returned no stock metadata for {symbol}")
+            if not isinstance(info, dict) or info.get("symbol") != symbol or not info.get("name"):
+                raise ValueError("Stock metadata does not match selected symbol")
             history = client.get_price_history(symbol, days=365)
             optional = {}
             failures = {}
             for category, method in (
                 ("snapshot", client.get_company_snapshot),
-                ("income", client.get_income_statement),
+                ("income", client.get_income_statement_df),
+                ("balance", client.get_balance_sheet_df),
+                ("cashflow", client.get_cash_flow_df),
+                ("ratios", client.get_financial_ratios_df),
                 ("dividends", client.get_dividends),
             ):
                 try:
@@ -87,12 +99,15 @@ class SarmaayaAdapter:
                 except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
                     failures["announcements"] = f"Dividend announcement acquisition failed ({type(exc).__name__}); no event coverage established."
             return self.normalize(symbol, info, history, **optional, failures=failures)
+        except UnknownSymbol:
+            raise
         except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
             raise DataUnavailable("Sarmaaya data unavailable or failed validation") from exc
         finally:
             client.session.close()
 
-    def normalize(self, symbol, info, history, snapshot=None, income=None, announcements=None, dividends=None, failures=None) -> TickerBundle:
+    def normalize(self, symbol, info, history, snapshot=None, income=None, announcements=None, dividends=None, failures=None,
+                  balance=None, cashflow=None, ratios=None) -> TickerBundle:
         symbol = normalize_symbol(symbol)
         if not isinstance(info, dict) or info.get("symbol") != symbol or not info.get("name"):
             raise ValueError("Stock metadata does not match selected symbol")
@@ -105,15 +120,24 @@ class SarmaayaAdapter:
             volume=decimal_or_none(info.get("volume")),
         )
         bars = []
+        invalid_market_caps = 0
         for row in history.to_dict(orient="records"):
             if row.get("symbol", symbol) != symbol:
                 raise ValueError("History contains a different symbol")
             stamp = pd.to_datetime(row["date"], utc=True)
             if pd.isna(stamp):
                 raise ValueError("History date missing")
+            try:
+                market_cap = decimal_or_none(row.get("marketCap"))
+                if market_cap is not None and (not market_cap.is_finite() or market_cap < 0):
+                    raise ValueError("Invalid market capitalization")
+            except (InvalidOperation, ValueError, TypeError):
+                market_cap = None
+                invalid_market_caps += 1
             bars.append(DailyBar(
                 date=stamp.date(), close=decimal_or_none(row.get("price")),
                 volume=decimal_or_none(row.get("volume")),
+                market_cap=market_cap,
             ))
         bars.sort(key=lambda bar: bar.date)
         refs = {
@@ -128,11 +152,14 @@ class SarmaayaAdapter:
             "profile": Coverage(status="partial", explanation="Name and sector available; business description not supplied by verified provider mapping."),
             "quote": Coverage(status="available" if quote.price is not None else "missing", explanation="Provider close; source timestamp is not a verified trading timestamp. Provider delay unknown."),
             "history": Coverage(status="partial" if bars else "missing", explanation=f"{len(bars)} observed close/volume bars; OHLC unavailable, adjustment basis and market-session completeness unverified."),
+            "market_cap_history": Coverage(status="partial" if any(bar.market_cap is not None for bar in bars) else "missing",
+                explanation=f"{sum(bar.market_cap is not None for bar in bars)} of {len(bars)} dated provider marketCap observations. Unit/scale and share basis unverified; values are not reconstructed from price or current shares. {invalid_market_caps} invalid values withheld. Missing records do not mean zero capitalization. Source: price_history."),
         }
         for category, reason in {
             "income": "Annual provider financial rows not loaded.",
-            "balance": "Unavailable in this adapter's declared reduced statement coverage: no verified balance-sheet source mapping. Empty rows do not mean zero balances; snapshot ratios are not a full statement.",
-            "cashflow": "Unavailable in this adapter's declared reduced statement coverage: no verified cash-flow source mapping. Empty rows do not mean zero cash flows; income is not a cash-flow statement.",
+            "balance": "Balance-sheet rows not loaded. Missing records do not mean zero balances.",
+            "cashflow": "Cash-flow rows not loaded. Missing records do not mean zero cash flows.",
+            "ratios": "Provider ratio observations not loaded; no ratios reconstructed.",
             "eps": "No verified EPS period and accounting basis.",
             "dividends": "No verified distribution-event mapping; empty records do not mean no payouts.",
             "index_memberships": "Constituents not ingested; absence does not mean exclusion.",
@@ -147,8 +174,10 @@ class SarmaayaAdapter:
         warnings = ["Access/presentation rights unverified; not a redistribution-permitted dataset.",
                     "Provider close is not a live intraday quote. Adjustment basis unverified.",
                     "Missing statement categories and dividend records do not mean zero activity."]
+        if invalid_market_caps:
+            warnings.append(f"Market-cap history: {invalid_market_caps} invalid provider values withheld; valid price/volume observations retained.")
         shares = Shares()
-        periods = []
+        statements = {"income": [], "balance": [], "cashflow": []}
         for category, message in (failures or {}).items():
             coverage[{"snapshot": "shares", "announcements": "dividends"}.get(category, category)] = Coverage(status="missing", explanation=message)
             warnings.append(message)
@@ -185,12 +214,20 @@ class SarmaayaAdapter:
                 shares = Shares()
                 coverage["shares"] = Coverage(status="missing", explanation=f"Snapshot validation failed ({type(exc).__name__}); no share values accepted.")
                 warnings.append(coverage["shares"].explanation)
-        if income is not None:
+        for category, frame, statement_type, endpoint, method in (
+            ("income", income, "income_statement", "income-statement", "get_income_statement_df"),
+            ("balance", balance, "balance_sheet", "balance-sheet", "get_balance_sheet_df"),
+            ("cashflow", cashflow, "cash_flow", "cashflow", "get_cash_flow_df"),
+            ("ratios", ratios, "ratios", "ratios", "get_financial_ratios_df"),
+        ):
+            if frame is None:
+                continue
             try:
-                if not isinstance(income, pd.DataFrame):
-                    raise ValueError("Income response must be a DataFrame")
-                if not income.empty and not info.get("isin"):
-                    raise ValueError("Income source requires an identified ISIN")
+                if not isinstance(frame, pd.DataFrame):
+                    raise ValueError("Fundamentals response must be a DataFrame")
+                if not frame.empty and not info.get("isin"):
+                    raise ValueError("Fundamentals source requires an identified ISIN")
+                source_ref = f"{category}_annual"
                 grouped = {}
                 income_facts = {}
                 monetary_metrics = {
@@ -208,47 +245,50 @@ class SarmaayaAdapter:
                     "FF_INT_EXP_NET": "net_interest_expense", "FF_INT_INC_NET": "net_interest_income",
                     "FF_PTX_INC": "profit_before_tax", "FF_NET_INC": "net_income", "FF_DIV_PFD": "preferred_dividends",
                 }
-                for label, column in income.to_dict().items():
-                    metric = column.get("metric")
-                    display = column.get("displayType")
-                    if not isinstance(metric, str) or not isinstance(display, str) or not isinstance(column.get("data"), list):
-                        raise ValueError("Unexpected provider income schema")
-                    for observation in column["data"]:
-                        if not isinstance(observation, dict) or observation.get("periodicity") != "ANN":
-                            raise ValueError("Nonannual or malformed income observation")
-                        end = pd.to_datetime(observation["date"], utc=True)
-                        if pd.isna(end):
-                            raise ValueError("Missing financial period end")
-                        end = end.date()
-                        fact_id = f"income:{metric}:{end}"
-                        if any(line.fact_id == fact_id for line in grouped.get(end, [])):
-                            raise ValueError("Duplicate provider financial observation")
-                        value = decimal_or_none(observation.get("value"))
-                        normalized_value = None
-                        if value is not None and metric in monetary_metrics:
-                            with localcontext() as context:
-                                context.prec = 28
-                                normalized_value = value * Decimal(1000000)
-                        grouped.setdefault(end, []).append(FinancialLine(
-                            reported_label=label, canonical_key=canonical_keys.get(metric), decimal_value=normalized_value, fact_id=fact_id))
-                        if value is not None:
-                            income_facts[fact_id] = Fact(fact_id=fact_id, value=value,
-                                unit="million PKR (user assumption)" if metric in monetary_metrics else f"unverified provider unit/scale; displayType={display}", period=str(end),
-                                basis="unknown", source_ref="income_annual",
-                                quality=f"provider-standardized; metric={metric}; displayType={display}; currency PKR user-supplied; monetary scale user-assumed; accounting basis unverified")
+                for observation in frame.to_dict(orient="records"):
+                    metric, display, label = observation.get("metric"), observation.get("display_type"), observation.get("name")
+                    if (not all(isinstance(item, str) and item for item in (metric, display, label))
+                            or observation.get("statement_type") != statement_type
+                            or observation.get("periodicity") != "ANN"):
+                        raise ValueError("Unexpected normalized fundamentals schema or period")
+                    end = pd.to_datetime(observation.get("period_end"), utc=True)
+                    if pd.isna(end) or end is None:
+                        raise ValueError("Missing financial period end")
+                    end = end.date()
+                    fact_id = f"{category}:{metric}:{end}"
+                    if any(line.fact_id == fact_id for line in grouped.get(end, [])):
+                        raise ValueError("Duplicate provider financial observation")
+                    value = decimal_or_none(observation.get("value"))
+                    if value is not None and not value.is_finite():
+                        raise ValueError("Nonfinite financial observation")
+                    scaled = category == "income" and metric in monetary_metrics
+                    normalized_value = value if category != "income" else None
+                    if value is not None and scaled:
+                        with localcontext() as context:
+                            context.prec = 28
+                            normalized_value = value * Decimal(1000000)
+                    grouped.setdefault(end, []).append(FinancialLine(
+                        reported_label=label, canonical_key=canonical_keys.get(metric) if category == "income" else None,
+                        decimal_value=normalized_value, fact_id=fact_id))
+                    if value is not None:
+                        income_facts[fact_id] = Fact(fact_id=fact_id, reported_label=label, value=value,
+                            unit="million PKR (user assumption)" if scaled else f"unverified provider unit/scale; displayType={display}",
+                            period=str(end), basis="unknown", source_ref=source_ref,
+                            quality=f"provider-standardized; metric={metric}; displayType={display}; numeric-coerced by client DataFrame, original strings/precision not retained; provider year={observation.get('year')}; fiscal period={observation.get('fiscal_period')}; accounting basis unverified")
                 periods = [FinancialPeriod(period_end=end, period_kind="annual", basis="unknown",
-                    currency="PKR", original_scale="million PKR (user assumption; monetary rows only)", source_ref="income_annual",
+                    currency="PKR", original_scale="million PKR (user assumption; monetary rows only)" if category == "income" else "unverified provider units/scale; PKR currency assumption",
+                    source_ref=source_ref,
                     lines=grouped[end]) for end in sorted(grouped, reverse=True)]
                 income_warnings = []
                 for index, period in enumerate(periods):
-                    if index + 1 < len(periods):
+                    if category != "balance" and index + 1 < len(periods):
                         previous_end = periods[index + 1].period_end
                         if (period.period_end.year == previous_end.year + 1
                                 and (period.period_end.month, period.period_end.day) == (previous_end.month, previous_end.day)):
                             period.period_start = previous_end + timedelta(days=1)
-                            income_warnings.append(f"Income period ending {period.period_end}: start {period.period_start} derived from previous annual end + 1 day, not supplied by provider.")
+                            income_warnings.append(f"{category} period ending {period.period_end}: start {period.period_start} derived from previous annual end + 1 day, not supplied by provider.")
                     if period.period_start is None:
-                        income_warnings.append(f"Income period ending {period.period_end}: start unknown; no adjacent comparable annual end available.")
+                        income_warnings.append(f"{category} period ending {period.period_end}: point-in-time balance" if category == "balance" else f"{category} period ending {period.period_end}: start unknown; no adjacent comparable annual end available.")
                 for end, lines in grouped.items():
                     counts = {}
                     for line in lines:
@@ -257,24 +297,29 @@ class SarmaayaAdapter:
                             counts[fact.value] = counts.get(fact.value, 0) + 1
                     repeated = {value for value, count in counts.items() if count >= 3}
                     if repeated:
-                        income_warnings.append(f"Income period {end}: identical nonzero values appear in at least three different metrics; verify against issuer statements before use.")
+                        income_warnings.append(f"{category} period {end}: identical nonzero values appear in at least three different metrics; verify against issuer statements before use.")
                         for line in lines:
                             fact = income_facts.get(line.fact_id)
                             if fact is not None and fact.value in repeated:
                                 fact.quality += "; repeated cross-metric value requires issuer verification"
-                refs["income_annual"] = SourceRef(provider="Sarmaaya standardized provider values",
-                    url=f"https://beta-restapi.sarmaaya.pk/api/stocks/fundamentals/income-statement?isin={info.get('isin', '')}&periodicity=ANN",
-                    acquisition_method="GET via SarmaayaClient.get_income_statement (isolated session)", acquired_at=now)
+                refs[source_ref] = SourceRef(provider="Sarmaaya standardized provider values",
+                    url=f"https://beta-restapi.sarmaaya.pk/api/stocks/fundamentals/{endpoint}?isin={info.get('isin', '')}&periodicity=ANN",
+                    acquisition_method=f"GET via SarmaayaClient.{method} (isolated session; tidy numeric-coerced DataFrame)", acquired_at=now)
                 facts.update(income_facts)
                 warnings.extend(income_warnings)
-                coverage["income"] = Coverage(status="partial" if periods else "missing",
-                    explanation=f"{len(periods)} provider annual periods of standardized income rows, not a verified full issuer statement. Known monetary metrics have canonical keys; unknown metrics remain unmapped. Monetary amounts use user-assumed million PKR scale. Raw values preserved in facts. EPS/percentages are not scaled. Starts derived where adjacent annual ends exist. Accounting basis verification deferred; balance and cash flow unavailable.")
+                if category in statements:
+                    statements[category] = periods
+                coverage[category] = Coverage(status="partial" if periods else "missing",
+                    explanation=f"{len(periods)} provider annual-date groups of standardized {category} observations; not verified issuer statements. Numeric-coerced provider values retained in facts, not original strings or precision. Accounting basis unknown. "
+                    + ("Known income monetary rows use user-assumed million PKR; EPS/percentages not scaled. " if category == "income" else "Units/scale unverified; no million-PKR scaling applied. ")
+                    + ("Balance sheet is point-in-time; no period start derived." if category == "balance" else "Starts derived only from adjacent comparable annual ends."))
                 if periods:
-                    warnings.append("Income currency PKR is user-supplied; million PKR monetary scale is a user assumption, not provider-verified. Accounting basis remains unknown; no annual/TTM EPS inferred.")
+                    warnings.append(f"{category} fundamentals are numeric-coerced, not raw provider observations; units and accounting basis require verification. No annual/TTM EPS inferred.")
+                    if category == "income":
+                        warnings.append("Income currency PKR is user-supplied; million PKR monetary scale is a user assumption, not provider-verified.")
             except (ValueError, KeyError, TypeError, InvalidOperation) as exc:
-                periods = []
-                coverage["income"] = Coverage(status="missing", explanation=f"Annual income validation failed ({type(exc).__name__}); quote/history remain usable.")
-                warnings.append(coverage["income"].explanation)
+                coverage[category] = Coverage(status="missing", explanation=f"Annual {category} validation failed ({type(exc).__name__}); quote/history remain usable.")
+                warnings.append(coverage[category].explanation)
         if announcements is not None:
             try:
                 if not isinstance(announcements, pd.DataFrame):
@@ -431,7 +476,7 @@ class SarmaayaAdapter:
         dates = sorted({bar.date for bar in bars} | ({quote.market_date} if quote.market_date else set()))
         dataset_id = f"sarmaaya-{symbol.lower()}"
         bundle = TickerBundle(symbol=symbol, company_name=info["name"], sector=info.get("sectorName"),
-            quote=quote, shares=shares, ohlcv=bars, financials={"income": periods}, dividends=distributions,
+            quote=quote, shares=shares, ohlcv=bars, financials=statements, dividends=distributions,
             dividend_summaries=dividend_summaries,
             source_refs=refs, facts=facts, coverage=coverage, warnings=warnings,
             dataset_id=dataset_id, fetched_at=now,

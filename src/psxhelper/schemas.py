@@ -2,9 +2,10 @@
 
 from datetime import date, datetime
 from decimal import Decimal
+import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 NonnegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
@@ -12,6 +13,30 @@ NonnegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 
 class Record(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class AssistantRequest(Record):
+    symbol: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16)]
+    bundle_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=800)]
+    period: date | None = None
+    basis: Literal["consolidated", "unconsolidated", "unknown"] = "unknown"
+
+
+class AssistantAnswer(Record):
+    explanation: Annotated[str, Field(min_length=1, max_length=2000)]
+    fact_refs: Annotated[list[str], Field(max_length=12)]
+    caveats: Annotated[list[Annotated[str, Field(min_length=1, max_length=400)]], Field(max_length=8)]
+    next_question: Annotated[str, Field(min_length=1, max_length=400)]
+
+    @model_validator(mode="after")
+    def reject_numeric_prose(self):
+        if re.search(r"\d|\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|billion|trillion)\b",
+                     " ".join([self.explanation, *self.caveats, self.next_question]), re.IGNORECASE):
+            raise ValueError("Use evidence references, not generated numeric claims")
+        if len(set(self.fact_refs)) != len(self.fact_refs):
+            raise ValueError("Evidence references must be unique")
+        return self
 
 
 class Quote(Record):
@@ -37,6 +62,7 @@ class DailyBar(Record):
     close: NonnegativeDecimal
     volume: NonnegativeDecimal | None = None
     source_ref: str = "price_history"
+    market_cap: NonnegativeDecimal | None = None
 
 
 class FinancialLine(Record):
@@ -65,6 +91,7 @@ class Financials(Record):
 
 class Fact(Record):
     fact_id: str
+    reported_label: str | None = None
     value: FiniteDecimal
     unit: str
     period: str | None = None

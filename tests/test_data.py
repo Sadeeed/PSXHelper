@@ -49,6 +49,43 @@ class TestData(unittest.TestCase):
         second.quote.price = Decimal(41)
         self.assertNotEqual(content_hash(second), first.bundle_hash)
 
+    def test_provider_market_cap_history_preserves_values_dates_and_source(self):
+        bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DEMO_ALT",
+            {"symbol": "DEMO_ALT", "name": "Synthetic company"}, pd.DataFrame([
+                {"date": "2026-10-02", "price": "4", "marketCap": "123456789012345.125"},
+                {"date": "2026-10-01", "price": "3", "marketCap": "0"},
+                {"date": "2026-09-30", "price": "2", "marketCap": None},
+            ]))
+        bars = bundle.model_dump(mode="json")["ohlcv"]
+        self.assertIsNone(bars[0]["market_cap"])
+        self.assertEqual(bars[1]["market_cap"], "0")
+        self.assertEqual(bars[2]["market_cap"], "123456789012345.125")
+        self.assertEqual(bars[2]["source_ref"], "price_history")
+        self.assertEqual(bundle.coverage["market_cap_history"].status, "partial")
+        self.assertIn("2 of 3", bundle.coverage["market_cap_history"].explanation)
+        self.assertIn("Unit/scale and share basis unverified", bundle.coverage["market_cap_history"].explanation)
+        self.assertIsNone(bundle.shares.total_outstanding)
+        bundle.ohlcv[2].market_cap = Decimal("123")
+        self.assertNotEqual(content_hash(bundle), bundle.bundle_hash)
+
+    def test_invalid_optional_market_cap_does_not_discard_price_history(self):
+        for value in ("-1", "Infinity", "-Infinity", "invalid"):
+            with self.subTest(value=value):
+                bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DEMO_ALT",
+                    {"symbol": "DEMO_ALT", "name": "Synthetic company"},
+                    pd.DataFrame([{"date": "2026-10-02", "price": "4", "marketCap": value}]))
+                self.assertIsNone(bundle.ohlcv[0].market_cap)
+                self.assertEqual(bundle.ohlcv[0].close, Decimal(4))
+                self.assertEqual(bundle.coverage["market_cap_history"].status, "missing")
+                self.assertIn("1 invalid values withheld", bundle.coverage["market_cap_history"].explanation)
+                self.assertTrue(any("valid price/volume observations retained" in warning for warning in bundle.warnings))
+
+    def test_absent_market_cap_stays_missing_without_share_reconstruction(self):
+        bundle = sample_bundle()
+        self.assertTrue(all(bar.market_cap is None for bar in bundle.ohlcv))
+        self.assertEqual(bundle.coverage["market_cap_history"].status, "missing")
+        self.assertIn("not reconstructed", bundle.coverage["market_cap_history"].explanation)
+
     def test_bad_history_and_symbol_mismatch_rejected(self):
         adapter = SarmaayaAdapter(client_factory=Mock())
         for history in [
@@ -77,14 +114,21 @@ class TestData(unittest.TestCase):
         client.get_stock_info.return_value = {"symbol": "DCR", "name": "Test"}
         client.get_price_history.return_value = pd.DataFrame()
         client.get_company_snapshot.return_value = []
-        client.get_income_statement.return_value = pd.DataFrame()
+        client.get_income_statement_df.return_value = pd.DataFrame()
+        client.get_balance_sheet_df.return_value = pd.DataFrame()
+        client.get_cash_flow_df.return_value = pd.DataFrame()
+        client.get_financial_ratios_df.return_value = pd.DataFrame()
         client.get_dividends.return_value = pd.DataFrame()
         adapter = SarmaayaAdapter(client_factory=lambda: client)
         self.assertEqual(adapter.fetch(" dcr ").symbol, "DCR")
         client.get_stock_info.assert_called_once_with("DCR")
         client.get_price_history.assert_called_once_with("DCR", days=365)
         client.get_company_snapshot.assert_called_once_with("DCR")
-        client.get_income_statement.assert_called_once_with("DCR")
+        client.get_income_statement_df.assert_called_once_with("DCR")
+        client.get_balance_sheet_df.assert_called_once_with("DCR")
+        client.get_cash_flow_df.assert_called_once_with("DCR")
+        client.get_financial_ratios_df.assert_called_once_with("DCR")
+        client.get_income_statement.assert_not_called()
         client.get_dividends.assert_called_once_with("DCR")
         client.session.close.assert_called_once()
 
@@ -105,16 +149,15 @@ class TestData(unittest.TestCase):
         self.assertEqual(bundle.coverage["shares"].status, "partial")
         self.assertEqual(bundle.facts["total_outstanding"].source_ref, "company_snapshot")
 
-    def test_income_uses_user_scale_preserving_raw_values_and_unknown_basis(self):
-        income = pd.DataFrame({
-            "Revenue": {"metric": "FF_SALES", "displayType": "wholeNumber", "data": [
-                {"date": "2025-06-30", "periodicity": "ANN", "value": "120"},
-                {"date": "2024-06-30", "periodicity": "ANN", "value": None},
-            ]},
-            "Basic EPS": {"metric": "FF_EPS_BASIC", "displayType": "float", "data": [
-                {"date": "2025-06-30", "periodicity": "ANN", "value": "4"},
-            ]},
-        })
+    def test_income_uses_user_scale_preserving_coerced_values_and_unknown_basis(self):
+        income = pd.DataFrame([
+            {"statement_type": "income_statement", "name": "Revenue", "metric": "FF_SALES",
+             "display_type": "wholeNumber", "period_end": "2025-06-30", "periodicity": "ANN", "value": 120},
+            {"statement_type": "income_statement", "name": "Revenue", "metric": "FF_SALES",
+             "display_type": "wholeNumber", "period_end": "2024-06-30", "periodicity": "ANN", "value": None},
+            {"statement_type": "income_statement", "name": "Basic EPS", "metric": "FF_EPS_BASIC",
+             "display_type": "float", "period_end": "2025-06-30", "periodicity": "ANN", "value": 4},
+        ])
         bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
             {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), income=income)
         self.assertEqual(len(bundle.financials.income), 2)
@@ -137,7 +180,8 @@ class TestData(unittest.TestCase):
         self.assertEqual(bundle.financials.cashflow, [])
         self.assertEqual(bundle.coverage["income"].status, "partial")
         self.assertEqual(bundle.manifest.content_hash, content_hash(bundle))
-        self.assertEqual(bundle.model_dump(mode="json")["facts"]["income:FF_SALES:2025-06-30"]["value"], "120")
+        self.assertEqual(Decimal(bundle.model_dump(mode="json")["facts"]["income:FF_SALES:2025-06-30"]["value"]), Decimal(120))
+        self.assertIn("original strings/precision not retained", bundle.facts["income:FF_SALES:2025-06-30"].quality)
 
     def test_income_start_requires_adjacent_comparable_annual_end(self):
         for dates, expected in (
@@ -147,9 +191,10 @@ class TestData(unittest.TestCase):
             (["2025-06-30"], None),
         ):
             with self.subTest(dates=dates):
-                income = pd.DataFrame({"Revenue": {"metric": "FF_SALES", "displayType": "wholeNumber", "data": [
-                    {"date": end, "periodicity": "ANN", "value": "120"} for end in reversed(dates)
-                ]}})
+                income = pd.DataFrame([
+                    {"statement_type": "income_statement", "name": "Revenue", "metric": "FF_SALES",
+                     "display_type": "wholeNumber", "period_end": end, "periodicity": "ANN", "value": 120}
+                    for end in reversed(dates)])
                 bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
                     {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), income=income)
                 start = bundle.financials.income[0].period_start
@@ -159,13 +204,70 @@ class TestData(unittest.TestCase):
                     self.assertTrue(any("derived from previous annual end" in warning for warning in bundle.warnings))
                 self.assertEqual(bundle.manifest.content_hash, content_hash(bundle))
 
-    def test_statement_categories_are_explicitly_unavailable_not_fabricated(self):
+    def test_unloaded_statement_categories_remain_missing_not_zero(self):
         bundle = sample_bundle()
         for category in ("balance", "cashflow"):
             self.assertEqual(getattr(bundle.financials, category), [])
             self.assertEqual(bundle.coverage[category].status, "missing")
-            self.assertIn("reduced statement coverage", bundle.coverage[category].explanation)
+            self.assertIn("not loaded", bundle.coverage[category].explanation)
             self.assertIn("not", bundle.coverage[category].explanation)
+
+    def test_balance_cashflow_and_ratios_use_tidy_values_without_guessed_scale(self):
+        info = {"symbol": "DEMO_ALT", "name": "Synthetic company", "isin": "PKTEST"}
+        balance = pd.DataFrame([{"statement_type": "balance_sheet", "name": "Cash",
+            "metric": "FF_CASH_GENERIC", "display_type": "wholeNumber", "period_end": end,
+            "periodicity": "ANN", "value": 12.5, "year": 2025, "fiscal_period": 0}
+            for end in ("2025-06-30", "2024-06-30")])
+        cashflow = pd.DataFrame([{"statement_type": "cash_flow", "name": "Cash movement",
+            "metric": "FF_NET_INC_CF", "display_type": "wholeNumber", "period_end": end,
+            "periodicity": "ANN", "value": -2.5}
+            for end in ("2025-06-30", "2024-06-30")])
+        ratios = pd.DataFrame([{"statement_type": "ratios", "name": "Basic EPS",
+            "metric": "FF_EPS_BASIC", "display_type": "float", "period_end": "2025-06-30",
+            "periodicity": "ANN", "value": 3.5}])
+        bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DEMO_ALT", info, pd.DataFrame(),
+            balance=balance, cashflow=cashflow, ratios=ratios)
+        self.assertEqual(len(bundle.financials.balance), 2)
+        self.assertTrue(all(period.period_start is None for period in bundle.financials.balance))
+        self.assertEqual(bundle.financials.balance[0].lines[0].decimal_value, Decimal("12.5"))
+        self.assertEqual(str(bundle.financials.cashflow[0].period_start), "2024-07-01")
+        self.assertEqual(bundle.financials.cashflow[0].lines[0].decimal_value, Decimal("-2.5"))
+        self.assertIn("unverified provider units", bundle.financials.balance[0].original_scale)
+        self.assertEqual(bundle.financials.balance[0].basis, "unknown")
+        self.assertIn("point-in-time", bundle.coverage["balance"].explanation)
+        for category in ("balance", "cashflow", "ratios"):
+            self.assertEqual(bundle.coverage[category].status, "partial")
+            self.assertIn(f"{category}_annual", bundle.source_refs)
+        fact = bundle.facts["ratios:FF_EPS_BASIC:2025-06-30"]
+        self.assertEqual(fact.value, Decimal("3.5"))
+        self.assertIn("unverified provider unit/scale", fact.unit)
+        self.assertIsNone(bundle.eps["reported_annual"])
+        self.assertEqual(bundle.manifest.content_hash, content_hash(bundle))
+        self.assertEqual(bundle.model_dump(mode="json")["financials"]["balance"][0]["lines"][0]["decimal_value"], "12.5")
+
+    def test_fundamentals_categories_fail_independently_without_accepting_partial_invalid_data(self):
+        valid = {"statement_type": "balance_sheet", "name": "Cash", "metric": "FF_CASH_GENERIC",
+            "display_type": "wholeNumber", "period_end": "2025-06-30", "periodicity": "ANN", "value": 5}
+        for invalid in ({**valid, "value": float("inf")}, {**valid, "period_end": pd.NaT},
+                        {**valid, "statement_type": "income_statement"}, {**valid, "periodicity": "LTM"}, valid):
+            with self.subTest(invalid=invalid):
+                bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DEMO_ALT",
+                    {"symbol": "DEMO_ALT", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(),
+                    balance=pd.DataFrame([valid, invalid]),
+                    cashflow=pd.DataFrame([{**valid, "statement_type": "cash_flow"}]))
+                self.assertEqual(bundle.financials.balance, [])
+                self.assertEqual(bundle.coverage["balance"].status, "missing")
+                self.assertNotIn("balance_annual", bundle.source_refs)
+                self.assertFalse(any(key.startswith("balance:") for key in bundle.facts))
+                self.assertEqual(len(bundle.financials.cashflow), 1)
+
+    def test_fundamentals_missing_numeric_values_remain_missing(self):
+        balance = pd.DataFrame([{"statement_type": "balance_sheet", "name": "Cash", "metric": "FF_CASH_GENERIC",
+            "display_type": "wholeNumber", "period_end": "2025-06-30", "periodicity": "ANN", "value": float("nan")}])
+        bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DEMO_ALT",
+            {"symbol": "DEMO_ALT", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), balance=balance)
+        self.assertIsNone(bundle.financials.balance[0].lines[0].decimal_value)
+        self.assertNotIn("balance:FF_CASH_GENERIC:2025-06-30", bundle.facts)
 
     def test_dividend_announcements_are_deduplicated_references_not_events(self):
         row = {"symbol": "DCR", "sysAnnouncementId": "TEST-1",
@@ -292,7 +394,7 @@ class TestData(unittest.TestCase):
         client.get_stock_info.return_value = {"symbol": "DCR", "name": "Test", "date": "2026-10-02T19:00:00Z"}
         client.get_price_history.return_value = pd.DataFrame()
         client.get_company_snapshot.return_value = []
-        client.get_income_statement.return_value = pd.DataFrame()
+        client.get_income_statement_df.return_value = pd.DataFrame()
         client.get_announcements.side_effect = requests.Timeout()
         bundle = SarmaayaAdapter(client_factory=lambda: client).fetch("DCR")
         client.get_announcements.assert_called_once_with("DCR", "2025-10-02", "2026-10-02")
@@ -305,7 +407,7 @@ class TestData(unittest.TestCase):
         client.get_stock_info.return_value = {"symbol": "DCR", "name": "Test", "close": "40"}
         client.get_price_history.return_value = pd.DataFrame()
         client.get_company_snapshot.side_effect = requests.HTTPError("503")
-        client.get_income_statement.side_effect = requests.Timeout()
+        client.get_income_statement_df.side_effect = requests.Timeout()
         bundle = SarmaayaAdapter(client_factory=lambda: client).fetch("DCR")
         self.assertEqual(bundle.quote.price, Decimal(40))
         self.assertEqual(bundle.coverage["income"].status, "missing")
@@ -315,13 +417,13 @@ class TestData(unittest.TestCase):
         client.session.close.assert_called_once()
 
     def test_repeated_nonzero_income_values_are_flagged_not_corrected(self):
-        income = pd.DataFrame({label: {"metric": metric, "displayType": display, "data": [
-            {"date": "2025-06-30", "periodicity": "ANN", "value": "7"},
-        ]} for label, metric, display in (
+        income = pd.DataFrame([{"statement_type": "income_statement", "name": label,
+            "metric": metric, "display_type": display, "period_end": "2025-06-30",
+            "periodicity": "ANN", "value": 7} for label, metric, display in (
             ("Revenue", "FF_SALES", "wholeNumber"),
             ("Net Income", "FF_NET_INC", "wholeNumber"),
             ("Basic EPS", "FF_EPS_BASIC", "float"),
-        )})
+        )])
         bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
             {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), income=income)
         self.assertTrue(any("at least three different metrics" in warning for warning in bundle.warnings))
@@ -331,21 +433,20 @@ class TestData(unittest.TestCase):
             self.assertEqual(fact.value, Decimal(7))
             self.assertIn("repeated cross-metric", fact.quality)
         self.assertEqual(bundle.manifest.content_hash, content_hash(bundle))
-        for column in income.columns:
-            income.at["data", column][0]["value"] = "0"
+        income["value"] = 0
         zero_bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
             {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), income=income)
         self.assertFalse(any("at least three different metrics" in warning for warning in zero_bundle.warnings))
 
     def test_income_does_not_scale_percentages_eps_or_unknown_metrics(self):
-        income = pd.DataFrame({label: {"metric": metric, "displayType": display, "data": [
-            {"date": "2025-06-30", "periodicity": "ANN", "value": value},
-        ]} for label, metric, display, value in (
+        income = pd.DataFrame([{"statement_type": "income_statement", "name": label,
+            "metric": metric, "display_type": display, "period_end": "2025-06-30",
+            "periodicity": "ANN", "value": value} for label, metric, display, value in (
             ("Net Income", "FF_NET_INC", "wholeNumber", "-1.25"),
             ("Operating Margin", "FF_OPER_MGN", "floatPercent", "20"),
             ("Basic EPS", "FF_EPS_BASIC", "float", "4"),
             ("Unknown amount", "UNVERIFIED", "wholeNumber", "30"),
-        )})
+        )])
         bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
             {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(), income=income)
         lines = bundle.financials.income[0].lines
@@ -358,9 +459,8 @@ class TestData(unittest.TestCase):
         self.assertEqual(bundle.model_dump(mode="json")["financials"]["income"][0]["lines"][0]["decimal_value"], "-1250000.00")
 
     def test_income_requires_source_identity(self):
-        income = pd.DataFrame({"Revenue": {"metric": "FF_SALES", "displayType": "wholeNumber", "data": [
-            {"date": "2025-06-30", "periodicity": "ANN", "value": "120"},
-        ]}})
+        income = pd.DataFrame([{"statement_type": "income_statement", "name": "Revenue", "metric": "FF_SALES",
+            "display_type": "wholeNumber", "period_end": "2025-06-30", "periodicity": "ANN", "value": 120}])
         bundle = SarmaayaAdapter(client_factory=Mock()).normalize("DCR",
             {"symbol": "DCR", "name": "Test", "close": "40"}, pd.DataFrame(), income=income)
         self.assertEqual(bundle.quote.price, Decimal(40))
@@ -384,7 +484,9 @@ class TestData(unittest.TestCase):
         ):
             with self.subTest(data=data):
                 bundle = adapter.normalize("DCR", {"symbol": "DCR", "name": "Test", "isin": "PKTEST"}, pd.DataFrame(),
-                    income=pd.DataFrame({"Revenue": {"metric": "FF_SALES", "displayType": "wholeNumber", "data": data}}))
+                    income=pd.DataFrame([{"statement_type": "income_statement", "name": "Revenue",
+                        "metric": "FF_SALES", "display_type": "wholeNumber", "period_end": row["date"],
+                        "periodicity": row["periodicity"], "value": row["value"]} for row in data]))
                 self.assertEqual(bundle.financials.income, [])
                 self.assertEqual(bundle.coverage["income"].status, "missing")
                 self.assertFalse(any(key.startswith("income:") for key in bundle.facts))
@@ -397,12 +499,67 @@ class TestData(unittest.TestCase):
                 SarmaayaAdapter(client_factory=lambda: client).fetch("DCR")
             client.session.close.assert_called_once()
 
-    def test_unsupported_symbol_never_calls_provider(self):
+    def test_invalid_symbol_never_calls_provider(self):
         factory = Mock()
-        for symbol in ["XYZ", "../DCR", "", "DCR?x=1"]:
+        for symbol in ["../DCR", "", "DCR?x=1", "DCR/OTHER", "A" * 17]:
             with self.subTest(symbol=symbol), self.assertRaises(UnknownSymbol):
                 SarmaayaAdapter(client_factory=factory).fetch(symbol)
         factory.assert_not_called()
+
+    def test_provider_backed_symbols_are_not_limited_to_demo_allowlist(self):
+        for symbol in (" demo_alt ", "123", "DEMO.R1", "DEMO-X"):
+            with self.subTest(symbol=symbol):
+                normalized = symbol.strip().upper()
+                client = Mock()
+                client.get_stock_info.return_value = {"symbol": normalized, "name": "Synthetic test company"}
+                client.get_price_history.return_value = pd.DataFrame()
+                client.get_company_snapshot.return_value = []
+                client.get_income_statement_df.return_value = pd.DataFrame()
+                client.get_dividends.return_value = pd.DataFrame()
+                service = ResearchService(SarmaayaAdapter(client_factory=lambda: client))
+                bundle = service.get(symbol)
+                self.assertEqual(bundle.symbol, normalized)
+                self.assertEqual(service.get(normalized).bundle_hash, bundle.bundle_hash)
+                client.get_stock_info.assert_called_once_with(normalized)
+                client.session.close.assert_called_once()
+
+    def test_provider_unknown_symbol_preserves_unknown_error_and_closes_session(self):
+        response = requests.Response()
+        response.status_code = 404
+        missing = requests.HTTPError("not found", response=response)
+        for payload in (None, {}, []):
+            with self.subTest(payload=payload):
+                client = Mock()
+                client.get_stock_info.return_value = payload
+                with self.assertRaises(UnknownSymbol):
+                    SarmaayaAdapter(client_factory=lambda: client).fetch("DEMO_UNKNOWN")
+                client.get_price_history.assert_not_called()
+                client.session.close.assert_called_once()
+        client = Mock()
+        client.get_stock_info.side_effect = missing
+        with self.assertRaises(UnknownSymbol):
+            SarmaayaAdapter(client_factory=lambda: client).fetch("DEMO_UNKNOWN")
+        client.get_price_history.assert_not_called()
+        client.session.close.assert_called_once()
+
+    def test_provider_lookup_errors_and_mismatches_are_not_unknown_tickers(self):
+        for status in (401, 429, 500):
+            with self.subTest(status=status):
+                client = Mock()
+                response = requests.Response()
+                response.status_code = status
+                client.get_stock_info.side_effect = requests.HTTPError("unavailable", response=response)
+                with self.assertRaises(DataUnavailable):
+                    SarmaayaAdapter(client_factory=lambda: client).fetch("DEMO_ALT")
+                client.session.close.assert_called_once()
+        for payload in ({"symbol": "OTHER", "name": "Test"}, {"symbol": "DEMO_ALT"}, [1]):
+            with self.subTest(payload=payload):
+                client = Mock()
+                client.get_stock_info.return_value = payload
+                with self.assertRaises(DataUnavailable):
+                    SarmaayaAdapter(client_factory=lambda: client).fetch("DEMO_ALT")
+                client.get_price_history.assert_not_called()
+                client.session.close.assert_called_once()
 
     def test_cache_and_failed_reload_preserve_original_data(self):
         adapter = Mock()

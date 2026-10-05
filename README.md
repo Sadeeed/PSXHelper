@@ -1,115 +1,124 @@
 # PSXHelper
 
-Beginner-oriented PSX research demo. Implementation is incremental; this is
-**research dashboard and reduced cash simulation implemented**, not the finished
-challenge application. Real local AI remains unimplemented.
+**A beginner-friendly Pakistan Stock Exchange research demo, built for a friend.**
 
-## Run from this repository
+My friend has been discussing investing with me for months but hasn't managed to
+start. PSXHelper brings company information and plain-language explanations into
+one place, helping him research his first stocks with less friction, not choosing
+stocks for him.
 
-Requires Python 3.12 and `uv`. The existing provider utility lives outside the
-installed package, so this checkpoint requires a source checkout and commands
-run from the repository root (standalone wheel installation is not supported yet).
+Built for the [Hacktoberfest Weekend Challenge: Build for a Friend](https://dev.to/challenges/hacktoberfest-weekend-2026-10-01).
+This is a demo. Its scope grew during development, and work may continue after October.
+
+## Features
+
+- Provider-validated ticker lookup; data availability varies by company.
+- Company snapshot, prices, share counts and price/market-cap history.
+- Income statements, balance sheets, cash flow and provider-reported ratios.
+- Yearly dividend summaries and payout observations.
+- Compact K/M/B figures, chart hover values and keyboard observation selection.
+- Cash preview showing affordable whole units and remaining PKR cash.
+- Local Gemma explanations with a separate panel of sourced evidence.
+- Visible missing-data states, source references and coverage caveats.
+
+## Local AI is core
+
+The explanation layer uses **Ollama and Gemma 4**, translating available research
+evidence into beginner-focused explanations. Model-generated prose is kept
+separate from financial figures; calculations use Python `Decimal`.
+
+The current implementation calls `gemma4:e4b` at
+`http://127.0.0.1:11434/api/chat`. E2B is the lighter deployment option, but model
+selection is currently hardcoded in `src/psxhelper/main.py`, not an environment
+setting. Using `gemma4:e2b` requires updating the request and reported model identifiers.
+
+Answers use a validated JSON contract and references to supplied evidence. Stale
+context, unavailable inference and unsupported output receive explicit errors.
+There is no cloud fallback. Qualitative explanations can still be wrong.
+
+## Stack
+
+Python 3.12 · FastAPI · pandas · Pydantic · HTML/CSS/JavaScript · Ollama · Gemma 4
+
+OpenCode was used as the AI coding agent.
+
+## Run locally
+
+Requires Python 3.12, `uv`, Ollama, and access to the private data SDK.
+Run application commands from the repository root; a standalone wheel is not supported.
+
+Install application dependencies:
 
 ```bash
 uv sync --locked
+```
+
+Install the current model separately. This command downloads model weights:
+
+```bash
+ollama pull gemma4:e4b
+```
+
+Ensure Ollama is running on loopback port `11434`. If it is not already managed
+by a local service, start it in a separate terminal:
+
+```bash
+OLLAMA_HOST=127.0.0.1:11434 ollama serve
+```
+
+Start PSXHelper:
+
+```bash
 uv run psxhelper
 ```
 
-Open <http://127.0.0.1:8000/docs> for interactive API documentation. Server binds
-only to loopback. `/` provides ticker lookup; `/stocks/DCR` opens the research page.
+- Dashboard: <http://127.0.0.1:8000>
+- Example company page: <http://127.0.0.1:8000/stocks/DCR>
+- API documentation: <http://127.0.0.1:8000/docs>
+- Runtime status: <http://127.0.0.1:8000/health>
+
+The application binds to loopback only. Local inference does not make market-data
+fetching offline: provider access still requires network connectivity.
+
+## Data access and permissions
+
+Data currently comes through a **private, unofficial SDK**. The data-fetching APIs
+will not be released publicly until full permission is obtained. Public source
+availability must not be interpreted as access to that SDK or permission to use,
+retain, publicly present or redistribute provider data.
+
+The adapter reuses `utils/sarmaaya_util.py` in the development checkout. No private
+SDK distribution instructions or provider credentials are included here.
+Datasets remain labeled `remote_unverified`; cached provider data is memory-only.
+
+## Important limitations
+
+- Educational research only, not investment advice, recommendations or trade execution.
+- Cash previews assume a one-unit lot and zero fees/taxes, using a dated close.
+- Statement accounting basis remains unknown. Only known income monetary rows use
+  a labeled, user-assumed million-PKR scale; other units/scales remain unverified.
+- Fundamentals are numeric-coerced; original decimal-string precision may be lost.
+- Missing information is not zero. Verified EPS may be unavailable, so P/E stays missing.
+- Market cap is provider-reported, not reconstructed from current share counts.
+- Dividend summaries are not verified trailing yields; ex-dates/lifecycle remain unknown.
+- Prices, source accuracy, adjustment basis and share effective dates require verification.
+
+## Tests
 
 ```bash
-curl http://127.0.0.1:8000/api/v1/stocks/DCR
 uv run --no-sync python -m unittest discover -s tests -v
 ```
 
-## Implemented
+Tests use mocked provider inputs. Passing them does not establish live-model
+quality, financial accuracy or data permissions. No fresh tests were run for this README update.
 
-- `/health`, `/api/v1/tickers`, `/api/v1/stocks/{symbol}`, its `/ohlcv` view,
-  and `/metrics` for price/volume, annual/TTM P/E and observed-volume averages.
-- One adapter reusing `utils/sarmaaya_util.py`; fundamentals use isolated sessions
-  to avoid the observed sticky-cookie 401 failure.
-- Provider-validated free-text ticker lookup; DCR/AHCL are examples, not an allowlist.
-- Quote and daily close/volume normalization, decimal-string JSON, source dates,
-  provenance, coverage, manifest, and content hash excluding retrieval timestamps.
-- Process-memory cache. No background refresh or disk storage. Restarting while
-  offline cannot load cached data yet. Internal failed reload retains original data.
-- Unknown symbols return 404; provider/validation failures return 503.
-- Provider payout history and separate `dividend_summaries.dps` / `.yield`
-  year-keyed facts in the aggregate response. Summaries preserve decimal strings,
-  units, source and original provider values; not calculated trailing metrics.
-- All four annual fundamentals use tidy `_df` methods. Income, point-in-time
-  balance sheets and cash flow are statement rows; financial ratios are facts.
-- Sarmaaya-reference dashboard structure: ticker header, compact snapshot and
-  chart, section navigation, date-column financial/ratio tables and dividends.
-  Evidence and coverage remain accessible in expandable sections.
-- Dated provider `marketCap` values in `ohlcv` and its API view, with independent
-  `market_cap_coverage`; units/scale unverified, no share-count reconstruction.
-- Price/market-cap chart switch, hover/touch exact-value readout and keyboard
-  observation slider. Missing market-cap observations leave gaps in the line.
-- `POST /api/v1/allocations/preview`: single-stock, assumed one-unit lot,
-  zero-fee PKR cash simulation with whole quantities and exact residual cash.
+## What's next
 
-Live aggregate smoke checks returned 200 for both DCR and AHCL, with 249 bars each
-and market date 2026-10-02. After restart, both aggregate responses also contain
-five periods per statement category and 269 ratio facts each. Dividends and cash
-preview also passed earlier live smoke checks. Last approved unit execution:
-**92/92 passed**, before the later dashboard restyle. Synthetic Playwright chart
-checks passed before final mobile wrapping and dashboard changes; those changes
-remain unverified. Latest market-cap/dashboard live checks need user restart.
-Provider availability may change; successful tests/fetching do not establish data
-rights or accuracy.
+Improve beginner explanations, model evaluation and dashboard usability; collect
+my friend's feedback; resolve data permissions before broader distribution.
 
-## Observed limitations
-
-Initial 401 observations are resolved: latest source probes returned 200 for
-annual income and 201 for company snapshots for both tickers. The adapter now
-fetches quote, 365-day history, company snapshot, four annual fundamentals, dividend history
-and dated announcement references. Optional failures leave quote/history usable
-with explicit coverage gaps.
-
-Historical responses contain `price`, not full OHLC. Open/high/low remain null.
-Adjustment basis, quote delay, and session completeness remain unverified.
-Provider share counts are ingested, but effective dates and trading-unit
-compatibility remain unverified. Annual income monetary rows use user-confirmed
-PKR currency and a labeled user-assumed million-PKR scale; normalized values are
-PKR while numeric-coerced provider values remain in facts. Original fundamentals
-strings/precision are not retained by the client. EPS, percentages and unknown metrics are
-not multiplied by a million. Period starts derive from the preceding adjacent
-comparable annual end + 1 day; missing predecessors, gaps and changed fiscal
-year-ends leave starts null. Derived dates are labeled, not provider-reported.
-Accounting-basis verification is deferred at the user's request; basis remains
-unknown. Known monetary income metrics have canonical keys; unknown metrics
-remain unmapped. Repeated cross-metric values receive warnings. These standardized
-rows are not presented as a verified full issuer income statement.
-
-Business description, verified EPS and index membership remain missing/unknown.
-Balance/cash-flow rows are available with unverified units/scale and unknown
-accounting basis; they are not silently scaled by a million. Dividend payout records are available with unknown
-ex-dates and lifecycle statuses; conflicting per-share amounts are withheld.
-Posting/announcement dates do not substitute for ex-dates. Payouts are excluded
-from trailing DPS/yield; provider-reported yearly summaries can display separately.
-Do not infer outstanding shares from provider market capitalization. Financial
-metadata uses the declared user-approved assumptions and date-derivation rule,
-not verified provider metadata. Deferred accounting basis is not inferred from
-ANN/LTM or ticker. Period-start, dividend and market-cap mapping tests pass.
-
-`data_mode=remote_unverified` is an intentional temporary extension to the plan's
-three release modes: accessible provider observations have not established
-authorized acquisition, retention, public demonstration or redistribution rights.
-No provider fixtures are committed. Live-fetch **release gate remains unverified**.
-This application provides educational information, not recommendations or trading.
-
-## Local model
-
-Runtime binaries exist. Initial cache inspection found
-`gemma-3-270m-Q8_0.gguf`; instruction tuning, chat template, compatibility and
-answer quality are **not yet verified**. No model was downloaded or started.
-The local assistant is not implemented; `/health` says `not connected`.
-
-## Next checkpoints
-
-Track acceptance and blockers in [docs/implementation-progress.md](docs/implementation-progress.md).
-Full scope: [demo plan](docs/challenge-demo-plan.md). Final dashboard verification,
-remaining provider-backed expansion, local AI, permitted offline snapshots,
-recording and submission remain.
+See [implementation progress](docs/implementation-progress.md),
+[deferred data work](docs/deferred-data-work.md) and the
+[demo plan](docs/challenge-demo-plan.md) for development notes. Older planning
+documents may still describe the earlier `llama.cpp` runtime choice; the current
+implementation uses Ollama.
